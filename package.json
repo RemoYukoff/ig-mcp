@@ -1,0 +1,13 @@
+{
+  "name": "ig-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP para publicar en Instagram (historias) desde Meta Business Suite con la sesión de cualquier cuenta de Facebook",
+  "bin": { "ig-mcp": "server.mjs" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.0",
+    "playwright-core": "1.58.2",
+    "zod": "^3.25.0"
+  }
+}
