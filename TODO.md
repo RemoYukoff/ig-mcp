@@ -9,3 +9,6 @@
 - [ ] **Subir publicaciones.** Una tool `upload_post` para el feed: imagen
   suelta, carrusel y reel, con caption. Capturar el flujo del composer de
   publicaciones de Business Suite como se hizo con el de historias.
+- [ ] **Historias programadas.** El composer de Business Suite tiene "Programar"
+  además de "Compartir ahora". Capturar qué cambia en la mutation (fecha y hora
+  de publicación) y sumar un parámetro `schedule_at` a `upload_story`.
