@@ -3,7 +3,8 @@
 MCP para publicar en Instagram desde Meta Business Suite con la sesión
 de cualquier cuenta de Facebook, para cualquier página que tenga una cuenta de
 Instagram vinculada. Por ahora publica historias; lo que falta está en
-[`TODO.md`](TODO.md).
+[`TODO.md`](TODO.md) y cómo capturar un flujo nuevo de la web, en
+[`CAPTURA.md`](CAPTURA.md).
 
 Hace lo mismo que el composer de historias de Business Suite: sube la foto
 (`upload-business.facebook.com/ajax/react_composer/attachments/photo/upload`) y
