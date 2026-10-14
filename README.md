@@ -7,7 +7,8 @@ Instagram vinculada. Por ahora publica historias; lo que falta está en
 [`CAPTURA.md`](CAPTURA.md).
 
 Hace lo mismo que el composer de historias de Business Suite: sube la foto
-(`upload-business.facebook.com/ajax/react_composer/attachments/photo/upload`) y
+(`upload-business.facebook.com/ajax/react_composer/attachments/photo/upload`)
+o el video (`vupload-edge-business.facebook.com` + `rupload.facebook.com`) y
 publica con la mutation `BusinessComposerStoryCreationMutation` de
 `/api/graphql/`. Las llamadas salen desde una página de Business Suite abierta en
 un perfil de Brave propio, así usan la sesión y los tokens de esa página. No usa
@@ -30,7 +31,8 @@ claude mcp add --scope user ig-mcp -- node "$PWD/server.mjs"
 | --- | --- |
 | `authenticate` | Abre Brave. Iniciás sesión en Facebook y elegís en Business Suite la página; un recuadro flotante muestra en vivo la página y la cuenta de IG detectadas. Con `IG_MCP_ACCOUNT` no hay botón: la ventana se cierra sola cuando detecta esa cuenta y con otra queda abierta avisando. Sin ella, **Confirmar** guarda la que se ve. `profile` separa cuentas de Facebook distintas (por defecto `default`). |
 | `list_accounts` | Cuentas de IG guardadas, su página, su perfil y si la sesión sigue activa. |
-| `upload_story` | `path` (ruta absoluta, .png/.jpg, 1080×1920), `account` (usuario de IG; opcional si hay una sola), `also_facebook`, `dry_run` (sube la foto sin publicar). |
+| `upload_story` | `path` (ruta absoluta, .png/.jpg o .mp4/.mov con su audio, 1080×1920), `account` (usuario de IG; opcional si hay una sola), `also_facebook`, `schedule_at` (programar: segundos unix o ISO 8601 con zona), `dry_run` (sube la foto o el video sin publicar). |
+| `best_times` | Los "momentos de más actividad" de Business Suite: tres horarios próximos por canal, con el valor para `schedule_at`. `account`, `also_facebook`. No publica. |
 
 ## Una cuenta por proyecto
 
@@ -76,7 +78,9 @@ El MCP nunca devuelve cookies ni tokens: solo dice si hay sesión y cuándo venc
 
 ## Límites
 
-- Solo imágenes; sin video ni stickers (Business Suite no ofrece sticker de link para IG).
+- Imágenes y videos (el video va con el audio que ya tenga mezclado). Sin
+  stickers ni la música de Instagram (Business Suite no ofrece sticker de link
+  para IG ni música en historias).
 - Es la API interna de la web de Meta, no una pública: puede romperse cuando
   Meta cambie la web, y automatizar la sesión va contra sus términos.
 - El `doc_id` de la mutation rota con los deploys de Meta. Se busca el vigente en

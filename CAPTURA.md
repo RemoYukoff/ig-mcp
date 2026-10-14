@@ -124,6 +124,16 @@ primera tiene `data`.
   `bootloader-endpoint`, las queries de navegación (`BusinessCometLeftNavQuery`,
   etc.) y `/business/content/preview/` (solo genera la vista previa).
 
+Si la web no hace ningún request (Relay ya tiene los datos precargados o en
+caché), se puede leer el código de la página: buscar el módulo con
+`Object.keys(require('__debug').modulesMap)` (por ejemplo `/TimeRecommendation/`),
+sacar el `doc_id` de `require('<Nombre>_facebookRelayOperation')`, la forma de la
+respuesta de `require('<Nombre>.graphql').operation.selections`, y quién arma
+las variables bajando los scripts de `performance.getEntriesByType('resource')`
+y buscando `__d("<módulo>"`. Para que la extensión no bloquee el código
+minificado por parecer query strings, reemplazar `?`, `&` y `=` antes de
+devolverlo. Así salieron `best_times` y `schedule_at`.
+
 Lo capturado de historias quedó anotado en el comentario de cabecera de
 `server.mjs` y en `publishInPage`.
 

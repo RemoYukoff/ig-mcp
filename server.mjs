@@ -7,6 +7,19 @@
 // 2026-10-09): sube la foto a
 // upload-business.facebook.com/ajax/react_composer/attachments/photo/upload
 // y publica con la mutation BusinessComposerStoryCreationMutation de /api/graphql/.
+// Para programar, la misma mutation lleva unpublished_content_data
+// ({ scheduled_publish_time, unpublished_content_type: 'SCHEDULED' }) en base,
+// FACEBOOK_STORY e INSTAGRAM_STORY (leído del módulo
+// BusinessStoriesComposerMutationUtils el 2026-10-10). Los "momentos de más
+// actividad" salen de BusinessComposerScheduleTimeRecommendationsQuery.
+// Video (capturado el 2026-10-14): start en
+// vupload-edge-business.facebook.com/ajax/video/upload/requests/start/ (da
+// video_id y upload_session_id), los bytes en un POST a
+// rupload.facebook.com/fb_video/<clave>-0-<tamaño>, el handle que devuelve en
+// .../requests/receive/, después BusinessComposerVideoEncodingTriggerMutation,
+// BusinessComposerMediaUploadUtilsVideoStatusQuery hasta OK y
+// BusinessComposerVideoSetUndiscoverableMutation. La mutation de la historia es
+// la misma, con { video: { id } } en vez de { photo: { id } }.
 // Las llamadas salen desde una página de Business Suite abierta con un perfil
 // de Brave propio, así usan la sesión y los tokens de esa página.
 //
@@ -30,9 +43,15 @@ const HEADLESS = process.env.IG_MCP_HEADLESS !== '0';
 // doc_id de la mutation al capturarla. Meta lo rota con cada deploy: primero se
 // busca el vigente en los módulos de la página y este queda de respaldo.
 const DOC_ID_FALLBACK = process.env.IG_MCP_DOC_ID ?? '9453776261410796';
+const BEST_TIMES_DOC_ID_FALLBACK = '9893940570694200';
+const VIDEO_DOC_IDS = {
+  BusinessComposerVideoEncodingTriggerMutation: '24270092939258127',
+  BusinessComposerMediaUploadUtilsVideoStatusQuery: '29954615157462710',
+  BusinessComposerVideoSetUndiscoverableMutation: '9931897063525095',
+};
 
 const BS = 'https://business.facebook.com/latest/';
-const MIME = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png' };
+const MIME = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.mp4': 'video/mp4', '.mov': 'video/quicktime' };
 
 // IG_MCP_ACCOUNT fija la cuenta del proyecto (ver README).
 const PINNED = process.env.IG_MCP_ACCOUNT?.replace(/^@/, '') || null;
@@ -259,21 +278,103 @@ async function listAccounts() {
   }).join('\n'));
 }
 
-// Corre dentro de la página de Business Suite: sube la foto y publica.
-async function publishInPage({ b64, name, mime, pageId, igId, docIdFallback, alsoFacebook, dryRun }) {
+// Se instala en la página de Business Suite antes de las llamadas: arma los
+// parámetros de sesión y hace los POST a /api/graphql/. Los tokens se leen en
+// el momento y no salen de la página.
+function installPageHelpers() {
   const req = window.require;
-  const dtsg = req('DTSGInitialData').token;
-  let lsd = '';
-  try { lsd = req('LSD').token; } catch {}
-  const userId = req('CurrentUserInitialData').USER_ID;
-  let sum = 0;
-  for (const ch of dtsg) sum += ch.charCodeAt(0);
-  let asyncParams = {};
-  try { asyncParams = req('getAsyncParams')('POST'); } catch {}
-  const common = { ...asyncParams, av: pageId, __user: userId, __a: '1', fb_dtsg: dtsg, jazoest: `2${sum}`, lsd };
+  const common = (pageId) => {
+    const dtsg = req('DTSGInitialData').token;
+    let lsd = '';
+    try { lsd = req('LSD').token; } catch {}
+    let sum = 0;
+    for (const ch of dtsg) sum += ch.charCodeAt(0);
+    let asyncParams = {};
+    try { asyncParams = req('getAsyncParams')('POST'); } catch {}
+    const userId = req('CurrentUserInitialData').USER_ID;
+    return { ...asyncParams, av: pageId, __user: userId, __a: '1', fb_dtsg: dtsg, jazoest: `2${sum}`, lsd };
+  };
+  const graphql = async (pageId, name, docIdFallback, variables) => {
+    let docId = docIdFallback;
+    try { docId = String(req(`${name}_facebookRelayOperation`) || docIdFallback); } catch {}
+    const params = common(pageId);
+    const res = await fetch('/api/graphql/', {
+      method: 'POST',
+      body: new URLSearchParams({
+        ...params,
+        fb_api_caller_class: 'RelayModern',
+        fb_api_req_friendly_name: name,
+        server_timestamps: 'true',
+        variables: JSON.stringify(variables),
+        doc_id: docId,
+      }),
+      credentials: 'include',
+      headers: { 'X-FB-Friendly-Name': name, 'X-FB-LSD': params.lsd },
+    });
+    const resText = await res.text();
+    let json = {};
+    try { json = JSON.parse(resText.split('\n')[0]); } catch {}
+    return { docId, status: res.status, data: json.data, error: json.errors?.[0]?.message ?? resText.slice(0, 200) };
+  };
+  window.__igMcp = { common, graphql };
+}
 
-  // 1. Subida de la foto
+// Corre dentro de la página de Business Suite: sube la foto o el video y
+// publica (o programa, si viene scheduleAt en segundos unix).
+async function publishInPage({ b64, name, mime, pageId, igId, docIdFallback, videoDocIds, alsoFacebook, scheduleAt, dryRun }) {
+  const common = window.__igMcp.common(pageId);
+  const userId = common.__user;
   const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+  const isVideo = mime.startsWith('video/');
+
+  // 1. Subida
+  let media, original, mediaId;
+  if (isVideo) {
+    const v = await window.__igMcpUpload.uploadVideo(bytes, name, pageId, common, videoDocIds);
+    if (v.error) return v;
+    mediaId = v.videoId;
+    media = { video: { id: mediaId, story_call_to_action_data: null, overlays: [] } };
+    original = [];
+  } else {
+    const p = await window.__igMcpUpload.uploadPhoto(bytes, name, mime, userId, common);
+    if (p.error) return p;
+    mediaId = p.photoId;
+    media = { photo: { id: mediaId, story_call_to_action_data: null, overlays: [] } };
+    original = [{ original_photo_id: mediaId, burned_photo: { story_call_to_action_data: null, id: mediaId, overlays: [] } }];
+  }
+  if (dryRun) return { mediaId, isVideo, dryRun: true };
+
+  // 2. Publicación
+  const scheduled = scheduleAt ? { scheduled_publish_time: scheduleAt, unpublished_content_type: 'SCHEDULED' } : null;
+  const perChannel = scheduled ? { unpublished_content_data: scheduled } : {};
+  const variables = {
+    input: {
+      client_mutation_id: '1',
+      base: {
+        actor_id: pageId,
+        composer_entry_point: 'biz_web_home_stories',
+        source: 'WWW',
+        unpublished_content_data: scheduled,
+        attachments: [media],
+        story_original_attachments_data: original,
+      },
+      channels: alsoFacebook ? ['FACEBOOK_STORY', 'INSTAGRAM_STORY'] : ['INSTAGRAM_STORY'],
+      identities: [pageId, igId],
+      FACEBOOK_STORY: { geo_gating: null, attachments: [media], ...perChannel },
+      INSTAGRAM_STORY: { targeted_privacy_data: null, attachments: [media], ...perChannel },
+      logging: { composer_session_id: crypto.randomUUID() },
+    },
+    checkPhotosToReelsUpsellEligibility: false,
+  };
+  const r = await window.__igMcp.graphql(pageId, 'BusinessComposerStoryCreationMutation', docIdFallback, variables);
+  const created = r.data?.xfamily_content_create;
+  if (!created) return { step: 'publish', mediaId, docId: r.docId, status: r.status, error: r.error };
+  return { mediaId, isVideo, docId: r.docId, errors: created.errors };
+}
+
+// Las dos subidas corren en la página, como publishInPage; uploadStory las
+// instala como window.__igMcpUpload antes de publicar.
+async function uploadPhoto(bytes, name, mime, userId, common) {
   const form = new FormData();
   form.append('source', '8');
   form.append('profile_id', userId);
@@ -291,78 +392,119 @@ async function publishInPage({ b64, name, mime, pageId, igId, docIdFallback, als
   if (!photoId) {
     return { step: 'upload', status: up.status, error: upJson.errorSummary ?? upJson.errorDescription ?? upText.slice(0, 200) };
   }
-  if (dryRun) return { photoId, dryRun: true };
-
-  // 2. Publicación
-  let docId = docIdFallback;
-  try { docId = req('BusinessComposerStoryCreationMutation_facebookRelayOperation') || docIdFallback; } catch {}
-  const photo = { photo: { id: photoId, story_call_to_action_data: null, overlays: [] } };
-  const variables = {
-    input: {
-      client_mutation_id: '1',
-      base: {
-        actor_id: pageId,
-        composer_entry_point: 'biz_web_home_stories',
-        source: 'WWW',
-        unpublished_content_data: null,
-        attachments: [photo],
-        story_original_attachments_data: [
-          { original_photo_id: photoId, burned_photo: { story_call_to_action_data: null, id: photoId, overlays: [] } },
-        ],
-      },
-      channels: alsoFacebook ? ['FACEBOOK_STORY', 'INSTAGRAM_STORY'] : ['INSTAGRAM_STORY'],
-      identities: [pageId, igId],
-      FACEBOOK_STORY: { geo_gating: null, attachments: [photo] },
-      INSTAGRAM_STORY: { targeted_privacy_data: null, attachments: [photo] },
-      logging: { composer_session_id: crypto.randomUUID() },
-    },
-    checkPhotosToReelsUpsellEligibility: false,
-  };
-  const body = new URLSearchParams({
-    ...common,
-    fb_api_caller_class: 'RelayModern',
-    fb_api_req_friendly_name: 'BusinessComposerStoryCreationMutation',
-    server_timestamps: 'true',
-    variables: JSON.stringify(variables),
-    doc_id: docId,
-  });
-  const res = await fetch('/api/graphql/', {
-    method: 'POST',
-    body,
-    credentials: 'include',
-    headers: { 'X-FB-Friendly-Name': 'BusinessComposerStoryCreationMutation', 'X-FB-LSD': lsd },
-  });
-  const resText = await res.text();
-  let json = {};
-  try { json = JSON.parse(resText.split('\n')[0]); } catch {}
-  const created = json.data?.xfamily_content_create;
-  if (!created) {
-    return { step: 'publish', photoId, docId, status: res.status, error: json.errors?.[0]?.message ?? resText.slice(0, 200) };
-  }
-  return { photoId, docId, errors: created.errors };
+  return { photoId };
 }
 
-async function uploadStory({ path, account, also_facebook, dry_run }) {
+// start, los bytes a rupload, receive, encoding y espera a que Meta lo procese
+async function uploadVideo(bytes, name, pageId, common, docIds) {
+  const size = bytes.length;
+  const ext = (name.split('.').pop() || 'mp4').toLowerCase();
+  const waterfall = crypto.randomUUID().replace(/-/g, '');
+  const vupload = 'https://vupload-edge-business.facebook.com/ajax/video/upload/requests/';
+  const ajax = async (res) => {
+    const t = (await res.text()).replace(/^for \(;;\);/, '');
+    try { return { status: res.status, json: JSON.parse(t) }; } catch { return { status: res.status, json: {}, text: t.slice(0, 200) }; }
+  };
+  const why = (r) => r.json.errorSummary ?? r.json.errorDescription ?? r.text ?? JSON.stringify(r.json).slice(0, 200);
+  const shared = {
+    target_id: pageId, source: 'composer', composer_dialog_version: '', waterfall_id: waterfall,
+    composer_entry_point_ref: 'unknown', composer_work_shared_draft_mode: '', has_file_been_replaced: 'false',
+    supports_chunking: 'true', partition_start_offset: '0', partition_end_offset: String(size),
+  };
+
+  const start = await ajax(await fetch(vupload + 'start/?' + new URLSearchParams({ av: pageId, __a: '1' }), {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', X_FB_VIDEO_WATERFALL_ID: waterfall },
+    body: new URLSearchParams({
+      ...common, ...shared, file_size: String(size), file_extension: ext, supports_file_api: 'true',
+      creator_product: '2', spherical: 'false', video_publisher_action_source: '', dpr: '1',
+    }),
+  }));
+  const videoId = start.json.payload?.video_id, sessionId = start.json.payload?.upload_session_id;
+  if (!videoId) return { step: 'video start', status: start.status, error: why(start) };
+
+  const key = `${crypto.randomUUID().replace(/-/g, '')}-0-${size}`;
+  const up = await fetch(`https://rupload.facebook.com/fb_video/${key}?` + new URLSearchParams(common), {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'X-Entity-Name': 'undefined', 'X-Entity-Type': 'application/octet-stream', 'X-Entity-Length': String(size),
+      Offset: '0', start_offset: '0', end_offset: String(size), composer_session_id: waterfall,
+      id: String(sessionId), product_media_id: String(videoId), 'X-Total-Asset-Size': String(size),
+    },
+    body: new Blob([bytes], { type: 'application/octet-stream' }),
+  });
+  const upText = await up.text();
+  let handle = null;
+  try { handle = JSON.parse(upText).h; } catch {}
+  if (!handle) return { step: 'video bytes', status: up.status, error: upText.slice(0, 200) };
+
+  const form = new FormData();
+  form.append('fbuploader_video_file_chunk', handle);
+  const receive = await ajax(await fetch(vupload + 'receive/?' + new URLSearchParams({
+    av: pageId, video_id: videoId, start_offset: '0', end_offset: String(size), ...shared, upload_speed: '', ...common,
+  }), { method: 'POST', credentials: 'include', headers: { X_FB_VIDEO_WATERFALL_ID: waterfall }, body: form }));
+  if (receive.json.payload?.start_offset !== size) return { step: 'video receive', status: receive.status, error: why(receive) };
+
+  const gq = (op, variables) => window.__igMcp.graphql(pageId, op, docIds[op], variables);
+  const enc = await gq('BusinessComposerVideoEncodingTriggerMutation', {
+    input: { client_mutation_id: '1', video_id: videoId, actor_id: pageId, source: 'biz_composer' },
+  });
+  if (!enc.data?.video_encoding_trigger) return { step: 'video encoding', status: enc.status, error: enc.error };
+
+  let state = null;
+  for (let i = 0; i < 60 && state !== 'OK'; i++) {
+    await new Promise((r) => setTimeout(r, 3000));
+    const st = await gq('BusinessComposerMediaUploadUtilsVideoStatusQuery', { video_id: videoId });
+    state = st.data?.video?.video_status_type ?? state;
+    if (state === 'ERROR') return { step: 'video encoding', status: st.status, error: 'Meta no pudo procesar el video' };
+  }
+  if (state !== 'OK') return { step: 'video encoding', status: 0, error: `el video sigue en ${state} después de 3 min` };
+
+  const und = await gq('BusinessComposerVideoSetUndiscoverableMutation', { input: { client_mutation_id: '2', video_id: videoId } });
+  if (!und.data?.video_set_undiscoverable) return { step: 'video undiscoverable', status: und.status, error: und.error };
+  return { videoId };
+}
+
+// Corre dentro de la página de Business Suite: los "momentos de más actividad"
+// que muestra el diálogo de programar, en segundos unix por canal.
+async function bestTimesInPage({ pageId, igId, alsoFacebook, docIdFallback }) {
+  const variables = {
+    target_type: 'PAGE',
+    target_id: pageId,
+    params: {
+      placement: 'COMPOSER_SCHEDULE_STORY',
+      scheduling_config: alsoFacebook
+        ? { identities: [pageId, igId], channels: ['FACEBOOK_STORY', 'INSTAGRAM_STORY'] }
+        : { identities: [igId], channels: ['INSTAGRAM_STORY'] },
+      logging_data: { session_id: crypto.randomUUID() },
+    },
+  };
+  const r = await window.__igMcp.graphql(pageId, 'BusinessComposerScheduleTimeRecommendationsQuery', docIdFallback, variables);
+  const byChannel = r.data?.unifiedInterception?.decision?.auxiliary_data?.hotspotsByChannel;
+  if (!byChannel) return { docId: r.docId, status: r.status, error: r.error };
+  return { hotspots: Object.fromEntries(byChannel.map((c) => [c.channel, c.hotspots.map(Number)])) };
+}
+
+// Devuelve la cuenta guardada a usar, o el mensaje de error.
+async function pickAccount(account) {
   const accounts = await loadAccounts();
   const names = Object.keys(accounts);
   // La cuenta fijada es la que se usa por defecto y la única permitida, para no
   // publicar por error en la de otro proyecto.
   const asked = account?.replace(/^@/, '') || null;
-  if (PINNED && asked && asked !== PINNED) return fail(`Este proyecto está fijado a @${PINNED} (IG_MCP_ACCOUNT); no publica en @${asked}.`);
+  if (PINNED && asked && asked !== PINNED) return { error: `Este proyecto está fijado a @${PINNED} (IG_MCP_ACCOUNT); no publica en @${asked}.` };
   const wanted = asked ?? PINNED;
   const acc = wanted ? accounts[wanted] : names.length === 1 ? accounts[names[0]] : null;
-  if (!acc) {
-    if (!names.length) return fail('No hay cuentas guardadas: correr authenticate.');
-    return fail(`${wanted ? `No hay una cuenta @${wanted} guardada.` : 'Hay varias cuentas: indicar account.'} Guardadas: ${names.map((n) => '@' + n).join(', ')}.`);
-  }
+  if (acc) return { acc };
+  if (!names.length) return { error: 'No hay cuentas guardadas: correr authenticate.' };
+  return { error: `${wanted ? `No hay una cuenta @${wanted} guardada.` : 'Hay varias cuentas: indicar account.'} Guardadas: ${names.map((n) => '@' + n).join(', ')}.` };
+}
 
-  const file = resolve(path);
-  const mime = MIME[extname(file).toLowerCase()];
-  if (!mime) return fail(`Formato no soportado: ${extname(file)}. Usar .png o .jpg.`);
-  const { size } = await stat(file);
-  if (size > 30 * 1024 * 1024) return fail(`El archivo pesa ${(size / 1e6).toFixed(1)} MB; el máximo es 30 MB.`);
-  const b64 = (await readFile(file)).toString('base64');
-
+// Abre el composer de la cuenta y corre fn(page, igId) con los helpers ya
+// instalados en la página.
+async function withComposer(acc, fn) {
   const context = await openProfile(acc.profile, HEADLESS);
   try {
     if (!(await sessionInfo(context)).loggedIn) return fail(`El perfil "${acc.profile}" no tiene sesión: correr authenticate.`);
@@ -372,25 +514,77 @@ async function uploadStory({ path, account, also_facebook, dry_run }) {
     // El id de IG se toma fresco de la página: si la cuenta se desvinculó, no se publica.
     const current = found.ig.find((a) => a.username === acc.username);
     if (!current) return fail(`La página ${acc.pageId} ya no muestra @${acc.username} en Business Suite (ve: ${found.ig.map((a) => '@' + a.username).join(', ') || 'ninguna'}).`);
+    await page.evaluate(installPageHelpers);
+    return await fn(page, current.igId);
+  } finally {
+    await context.close();
+  }
+}
 
+const localTime = (unix) => new Date(unix * 1000).toLocaleString('es-AR', {
+  weekday: 'short', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', timeZoneName: 'short',
+});
+
+// schedule_at acepta segundos unix o una fecha ISO 8601 (sin zona = hora local).
+function parseSchedule(value) {
+  const unix = /^\d+$/.test(value) ? Number(value) : Math.floor(Date.parse(value) / 1000);
+  if (!Number.isFinite(unix)) return { error: `schedule_at inválido: "${value}". Usar segundos unix o ISO 8601 (2026-10-12T18:00-03:00).` };
+  if (unix <= Date.now() / 1000 + 60) return { error: `schedule_at (${localTime(unix)}) ya pasó o es en menos de un minuto.` };
+  return { unix };
+}
+
+async function uploadStory({ path, account, also_facebook, schedule_at, dry_run }) {
+  const { acc, error } = await pickAccount(account);
+  if (error) return fail(error);
+
+  const schedule = schedule_at ? parseSchedule(schedule_at) : {};
+  if (schedule.error) return fail(schedule.error);
+
+  const file = resolve(path);
+  const mime = MIME[extname(file).toLowerCase()];
+  if (!mime) return fail(`Formato no soportado: ${extname(file)}. Usar .png, .jpg, .mp4 o .mov.`);
+  const { size } = await stat(file);
+  const max = mime.startsWith('video/') ? 100 : 30;
+  if (size > max * 1024 * 1024) return fail(`El archivo pesa ${(size / 1e6).toFixed(1)} MB; el máximo es ${max} MB.`);
+  const b64 = (await readFile(file)).toString('base64');
+
+  return withComposer(acc, async (page, igId) => {
+    await page.evaluate(`window.__igMcpUpload = { uploadPhoto: ${uploadPhoto}, uploadVideo: ${uploadVideo} }`);
     const r = await page.evaluate(publishInPage, {
-      b64, name: basename(file), mime, pageId: acc.pageId, igId: current.igId,
-      docIdFallback: DOC_ID_FALLBACK, alsoFacebook: also_facebook, dryRun: dry_run,
+      b64, name: basename(file), mime, pageId: acc.pageId, igId,
+      docIdFallback: DOC_ID_FALLBACK, videoDocIds: VIDEO_DOC_IDS, alsoFacebook: also_facebook, scheduleAt: schedule.unix, dryRun: dry_run,
     });
 
     if (r.error) {
       const hint = r.step === 'publish' ? ` Si el doc_id (${r.docId}) quedó viejo, capturar el nuevo y pasarlo en IG_MCP_DOC_ID.` : '';
       return fail(`Falló el paso ${r.step} (HTTP ${r.status}): ${r.error}.${hint}`);
     }
-    if (r.dryRun) return text(`Dry run en @${acc.username}: foto subida sin publicar (photoID ${r.photoId}). No se creó ninguna historia.`);
+    const kind = r.isVideo ? 'videoID' : 'photoID';
+    if (r.dryRun) return text(`Dry run en @${acc.username}: ${r.isVideo ? 'video subido y procesado' : 'foto subida'} sin publicar (${kind} ${r.mediaId}). No se creó ninguna historia.`);
 
     const channels = also_facebook ? ['instagram_story', 'facebook_story'] : ['instagram_story'];
     const broken = Object.entries(r.errors ?? {}).filter(([k, v]) => v && channels.includes(k));
     if (broken.length) return fail(`Meta devolvió errores: ${JSON.stringify(Object.fromEntries(broken))}`);
-    return text(`Historia publicada en @${acc.username}${also_facebook ? ' y en su página de Facebook' : ''} (photoID ${r.photoId}, doc_id ${r.docId}). Puede tardar unos minutos en aparecer.`);
-  } finally {
-    await context.close();
-  }
+    const where = `@${acc.username}${also_facebook ? ' y en su página de Facebook' : ''}`;
+    const ids = `${kind} ${r.mediaId}, doc_id ${r.docId}`;
+    return text(schedule.unix
+      ? `Historia programada en ${where} para ${localTime(schedule.unix)} (${ids}). Se ve y se cancela en el Planificador de Business Suite.`
+      : `Historia publicada en ${where} (${ids}). Puede tardar unos minutos en aparecer.`);
+  });
+}
+
+async function bestTimes({ account, also_facebook }) {
+  const { acc, error } = await pickAccount(account);
+  if (error) return fail(error);
+  return withComposer(acc, async (page, igId) => {
+    const r = await page.evaluate(bestTimesInPage, {
+      pageId: acc.pageId, igId, alsoFacebook: also_facebook, docIdFallback: BEST_TIMES_DOC_ID_FALLBACK,
+    });
+    if (r.error) return fail(`Meta no devolvió horarios (HTTP ${r.status}, doc_id ${r.docId}): ${r.error}`);
+    const names = { INSTAGRAM_STORY: `Instagram @${acc.username}`, FACEBOOK_STORY: 'Página de Facebook' };
+    return text(Object.entries(r.hotspots).map(([channel, times]) =>
+      `${names[channel] ?? channel}:\n${times.map((t) => `- ${localTime(t)} · schedule_at ${t}`).join('\n')}`).join('\n\n'));
+  });
 }
 
 const profileArg = z.string().regex(/^[\w-]+$/).default('default')
@@ -412,13 +606,22 @@ server.registerTool('list_accounts', {
 }, () => serial(listAccounts));
 
 server.registerTool('upload_story', {
-  description: 'Publica una imagen (.png o .jpg, idealmente 1080×1920) como historia de Instagram vía Meta Business Suite. No admite sticker de link ni video. Publicar es visible para los seguidores: pedir OK al usuario antes.',
+  description: 'Publica una imagen (.png o .jpg) o un video (.mp4 o .mov), idealmente 1080×1920, como historia de Instagram vía Meta Business Suite, ya o programada con schedule_at (ver best_times). El audio del video va tal cual; no admite sticker de link ni la música de Instagram. Publicar o programar es visible para los seguidores: pedir OK al usuario antes.',
   inputSchema: {
-    path: z.string().describe('Ruta absoluta a la imagen'),
+    path: z.string().describe('Ruta absoluta a la imagen o el video'),
     account: z.string().optional().describe('Usuario de Instagram (con o sin @). Opcional si el proyecto fija IG_MCP_ACCOUNT o si hay una sola cuenta guardada'),
     also_facebook: z.boolean().default(false).describe('También como historia de la página de Facebook vinculada'),
-    dry_run: z.boolean().default(false).describe('Solo sube la foto (sin publicar) para probar sesión y endpoint'),
+    schedule_at: z.string().optional().describe('Programar en vez de publicar ya: segundos unix (como los que da best_times) o fecha ISO 8601 con zona (2026-10-12T18:00-03:00)'),
+    dry_run: z.boolean().default(false).describe('Solo sube la foto o el video (sin publicar) para probar sesión y endpoints'),
   },
 }, (args) => serial(() => uploadStory(args)));
+
+server.registerTool('best_times', {
+  description: 'Los "momentos de más actividad" que Meta recomienda para programar historias (los mismos del botón de Business Suite): tres horarios próximos por canal, con el valor para pasar a upload_story.schedule_at. No publica nada.',
+  inputSchema: {
+    account: z.string().optional().describe('Usuario de Instagram (con o sin @). Opcional si el proyecto fija IG_MCP_ACCOUNT o si hay una sola cuenta guardada'),
+    also_facebook: z.boolean().default(false).describe('Incluir también los horarios de la página de Facebook'),
+  },
+}, (args) => serial(() => bestTimes(args)));
 
 await server.connect(new StdioServerTransport());
